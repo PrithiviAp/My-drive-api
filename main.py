@@ -1,36 +1,36 @@
-"""
-main.py — My Drive API
-A private cloud storage backend: login, browse, upload, download,
-delete, rename, create-folder, search, and range-aware video streaming.
-
-Run locally:
-    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-
-Interactive docs:
-    http://localhost:8000/docs
-"""
-import mimetypes
 import re
 from pathlib import Path
-from typing import Optional
+from typing import List
 from s3 import s3, BUCKET
 from botocore.exceptions import ClientError
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from urllib.parse import quote 
 
-from config import ALLOWED_ORIGINS, MAX_UPLOAD_SIZE_BYTES, CHUNK_SIZE
+from config import ALLOWED_ORIGINS
 from database import init_db, get_db, User
 from auth import (
     authenticate_user,
     create_access_token,
     get_current_user,
+    get_current_user_stream,
     hash_password,
 )
+
+
+ 
+class BulkPathsRequest(BaseModel):
+    paths: List[str]
+ 
+ 
+class BulkDestinationRequest(BaseModel):
+    paths: List[str]
+    destination: str 
 
 app = FastAPI(
     title="My Drive API",
@@ -50,8 +50,7 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     init_db()
-    # Seed a default admin user ONLY if the users table is empty.
-    # Change this password immediately after first login.
+
     from database import SessionLocal
 
     db = SessionLocal()
@@ -60,12 +59,10 @@ def on_startup():
             admin = User(username="admin", hashed_password=hash_password("changeme123"))
             db.add(admin)
             db.commit()
-            print("⚠️  Seeded default user admin/changeme123 — change this immediately.")
     finally:
         db.close()
 
 
-# ── Schemas ──────────────────────────────────────────────────────────────
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -85,9 +82,9 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
-# ── Auth endpoints ───────────────────────────────────────────────────────
 @app.post("/login", response_model=TokenResponse, tags=["auth"])
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    print("user entering", form_data.username, form_data.password)
     user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
         raise HTTPException(
@@ -119,8 +116,6 @@ def change_password(
     return {"detail": "Password updated."}
 
 
-# ── File browsing ────────────────────────────────────────────────────────
-
 
 @app.get("/files")
 def list_files(path: str = "", current_user: User = Depends(get_current_user)):
@@ -133,7 +128,6 @@ def list_files(path: str = "", current_user: User = Depends(get_current_user)):
 
     entries = []
 
-    # Folders
     for folder in response.get("CommonPrefixes", []):
         entries.append({
             "name": Path(folder["Prefix"].rstrip("/")).name,
@@ -141,10 +135,8 @@ def list_files(path: str = "", current_user: User = Depends(get_current_user)):
             "type": "folder"
         })
 
-    # Files
     for obj in response.get("Contents", []):
 
-        # Skip the folder marker object
         if obj["Key"] == path:
             continue
 
@@ -186,7 +178,6 @@ def search(q: str, current_user: User = Depends(get_current_user)):
         "results": results
     }
 
-# ── Folder operations ────────────────────────────────────────────────────
 @app.post("/create-folder")
 def create_folder(body: FolderCreate, current_user: User = Depends(get_current_user)):
 
@@ -215,7 +206,6 @@ def rename(body: RenameRequest, current_user: User = Depends(get_current_user)):
             "message": "No changes."
         }
 
-    # ---------- Rename Folder ----------
     if old_path.endswith("/"):
 
         paginator = s3.get_paginator("list_objects_v2")
@@ -252,7 +242,6 @@ def rename(body: RenameRequest, current_user: User = Depends(get_current_user)):
             "type": "folder"
         }
 
-    # ---------- Rename File ----------
 
     try:
         s3.head_object(
@@ -289,8 +278,15 @@ def delete(file_path: str, current_user: User = Depends(get_current_user)):
 
     try:
 
-        # ---------- Delete Folder ----------
-        if file_path.endswith("/"):
+        folder_prefix = file_path.rstrip("/") + "/"
+
+        response = s3.list_objects_v2(
+            Bucket=BUCKET,
+            Prefix=folder_prefix,
+            MaxKeys=1
+        )
+
+        if response.get("KeyCount", 0) > 0:
 
             paginator = s3.get_paginator("list_objects_v2")
 
@@ -298,18 +294,15 @@ def delete(file_path: str, current_user: User = Depends(get_current_user)):
 
             for page in paginator.paginate(
                 Bucket=BUCKET,
-                Prefix=file_path
+                Prefix=folder_prefix
             ):
-
                 for obj in page.get("Contents", []):
-
                     objects_to_delete.append({
                         "Key": obj["Key"]
                     })
 
             if objects_to_delete:
 
-                # Delete in batches of 1000
                 for i in range(0, len(objects_to_delete), 1000):
 
                     s3.delete_objects(
@@ -324,7 +317,6 @@ def delete(file_path: str, current_user: User = Depends(get_current_user)):
                 "type": "folder"
             }
 
-        # ---------- Delete File ----------
 
         s3.delete_object(
             Bucket=BUCKET,
@@ -343,7 +335,6 @@ def delete(file_path: str, current_user: User = Depends(get_current_user)):
             detail=e.response["Error"]["Message"]
         )
     
-# ── Upload ────────────────────────────────────────────────────────────────
 @app.post("/upload", tags=["files"])
 async def upload_file(
     path: str = "",
@@ -376,30 +367,34 @@ async def upload_file(
         "path": key,
     }
 
-# ── Download ─────────────────────────────────────────────────────────────
-
 @app.get("/download/{file_path:path}", tags=["files"])
-def download(file_path: str, current_user: User = Depends(get_current_user)):
+def download(file_path: str, current_user: User = Depends(get_current_user_stream)):
     try:
         obj = s3.get_object(
             Bucket=BUCKET,
             Key=file_path
         )
 
+        filename = Path(file_path).name
+        ascii_fallback = filename.encode("ascii", "ignore").decode("ascii") or "download"
+        encoded_filename = quote(filename)  # UTF-8 percent-encoded, safe for headers
+
         return StreamingResponse(
             obj["Body"],
             media_type=obj.get("ContentType", "application/octet-stream"),
             headers={
-                "Content-Disposition": f'attachment; filename="{Path(file_path).name}"'
+                "Content-Disposition": (
+                    f'attachment; filename="{ascii_fallback}"; '
+                    f"filename*=UTF-8''{encoded_filename}"
+                )
             },
         )
 
     except ClientError:
         raise HTTPException(404, "File not found")
 
-# ── Preview (inline, e.g. images) ────────────────────────────────────────
 @app.get("/preview/{file_path:path}", tags=["files"])
-def preview(file_path: str, current_user: User = Depends(get_current_user)):
+def preview(file_path: str, current_user: User = Depends(get_current_user_stream)):
     try:
         obj = s3.get_object(
             Bucket=BUCKET,
@@ -413,12 +408,11 @@ def preview(file_path: str, current_user: User = Depends(get_current_user)):
 
     except ClientError:
         raise HTTPException(404, "File not found")
-# ── Video streaming with HTTP Range support (needed for seek/scrub) ─────
 RANGE_RE = re.compile(r"bytes=(\d+)-(\d*)")
 
 
 @app.get("/stream/{file_path:path}", tags=["files"])
-def stream_video(file_path: str, request: Request, current_user: User = Depends(get_current_user)):
+def stream_video(file_path: str, request: Request, current_user: User = Depends(get_current_user_stream)):
 
     try:
         range_header = request.headers.get("range")
@@ -450,3 +444,117 @@ def stream_video(file_path: str, request: Request, current_user: User = Depends(
 
     except ClientError:
         raise HTTPException(404, "Video not found")
+
+
+def _delete_key_recursive(key: str) -> None:
+    """Delete a single object, or every object under it if it's a folder."""
+    folder_prefix = key.rstrip("/") + "/"
+    probe = s3.list_objects_v2(Bucket=BUCKET, Prefix=folder_prefix, MaxKeys=1)
+ 
+    if probe.get("KeyCount", 0) > 0:
+        paginator = s3.get_paginator("list_objects_v2")
+        objects_to_delete = []
+        for page in paginator.paginate(Bucket=BUCKET, Prefix=folder_prefix):
+            for obj in page.get("Contents", []):
+                objects_to_delete.append({"Key": obj["Key"]})
+        for i in range(0, len(objects_to_delete), 1000):
+            s3.delete_objects(Bucket=BUCKET, Delete={"Objects": objects_to_delete[i:i + 1000]})
+    else:
+        s3.delete_object(Bucket=BUCKET, Key=key)
+ 
+ 
+def _copy_key_recursive(old_key: str, new_key: str, delete_source: bool) -> None:
+    """Copy a single object, or an entire folder's contents, to new_key.
+    When delete_source is True this behaves like the existing /rename move;
+    when False it's a pure copy that leaves the source untouched."""
+    folder_prefix = old_key.rstrip("/") + "/"
+    probe = s3.list_objects_v2(Bucket=BUCKET, Prefix=folder_prefix, MaxKeys=1)
+    is_folder = probe.get("KeyCount", 0) > 0
+ 
+    if is_folder:
+        new_prefix = new_key.rstrip("/") + "/"
+        paginator = s3.get_paginator("list_objects_v2")
+        source_keys = []
+        for page in paginator.paginate(Bucket=BUCKET, Prefix=folder_prefix):
+            for obj in page.get("Contents", []):
+                source_keys.append(obj["Key"])
+ 
+        for src_key in source_keys:
+            dst_key = new_prefix + src_key[len(folder_prefix):]
+            s3.copy_object(Bucket=BUCKET, CopySource={"Bucket": BUCKET, "Key": src_key}, Key=dst_key)
+ 
+        if delete_source:
+            objects_to_delete = [{"Key": k} for k in source_keys]
+            for i in range(0, len(objects_to_delete), 1000):
+                s3.delete_objects(Bucket=BUCKET, Delete={"Objects": objects_to_delete[i:i + 1000]})
+    else:
+        try:
+            s3.head_object(Bucket=BUCKET, Key=new_key)
+            raise HTTPException(409, f"Destination already exists: {new_key}")
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in ("404", "NoSuchKey", "NotFound"):
+                raise
+ 
+        s3.copy_object(Bucket=BUCKET, CopySource={"Bucket": BUCKET, "Key": old_key}, Key=new_key)
+        if delete_source:
+            s3.delete_object(Bucket=BUCKET, Key=old_key)
+ 
+ 
+def register_bulk_routes(app):
+
+    """Call register_bulk_routes(app) once, after `app = FastAPI(...)`."""
+ 
+    @app.post("/bulk-delete", tags=["files"])
+    def bulk_delete(body: BulkPathsRequest, current_user: User = Depends(get_current_user)):
+        errors = {}
+        deleted = []
+        for p in body.paths:
+            try:
+                _delete_key_recursive(p)
+                deleted.append(p)
+            except ClientError as e:
+                errors[p] = e.response["Error"]["Message"]
+        if errors and not deleted:
+            raise HTTPException(status_code=500, detail=errors)
+        return {"deleted": deleted, "errors": errors}
+ 
+    @app.post("/bulk-move", tags=["files"])
+    def bulk_move(body: BulkDestinationRequest, current_user: User = Depends(get_current_user)):
+        dest = body.destination.rstrip("/")
+        moved = []
+        errors = {}
+        for p in body.paths:
+            name = Path(p.rstrip("/")).name
+            new_key = f"{dest}/{name}" if dest else name
+            try:
+                _copy_key_recursive(p, new_key, delete_source=True)
+                moved.append({"old_path": p, "new_path": new_key})
+            except HTTPException as e:
+                errors[p] = e.detail
+            except ClientError as e:
+                errors[p] = e.response["Error"]["Message"]
+        if errors and not moved:
+            raise HTTPException(status_code=500, detail=errors)
+        return {"moved": moved, "errors": errors}
+ 
+    @app.post("/bulk-copy", tags=["files"])
+    def bulk_copy(body: BulkDestinationRequest, current_user: User = Depends(get_current_user)):
+        dest = body.destination.rstrip("/")
+        copied = []
+        errors = {}
+        for p in body.paths:
+            name = Path(p.rstrip("/")).name
+            new_key = f"{dest}/{name}" if dest else name
+            try:
+                _copy_key_recursive(p, new_key, delete_source=False)
+                copied.append({"old_path": p, "new_path": new_key})
+            except HTTPException as e:
+                errors[p] = e.detail
+            except ClientError as e:
+                errors[p] = e.response["Error"]["Message"]
+        if errors and not copied:
+            raise HTTPException(status_code=500, detail=errors)
+        return {"copied": copied, "errors": errors}
+
+
+register_bulk_routes(app) 
